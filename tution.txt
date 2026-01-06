@@ -1,0 +1,397 @@
+@extends('layouts.admin')
+
+@section('content')
+<div class="container" style="width: 700px;">
+    <!-- <h2>Session Booking</h2> -->
+    <div id="formErrors" class="alert alert-danger d-none"></div>
+    <form method="POST" id="bookingForm" action="{{ route('student.book.session_process') }}">
+        @csrf
+        <div class="section">
+            <!-- <h3>Select Date</h3> -->
+            <input type="date" id="booking_date" name="booking_date" min="{{ now()->toDateString() }}">
+            <div class="text-danger small mt-1" id="error-subject_id"></div>
+        </div>
+        <div class="section">
+            <h3>Select Subject</h3>
+            <select name="subject_id" id="subject" class="student_selection">
+                <option value="">Select Subject</option>
+                @foreach($subjects as $subject)
+                    <option value="{{ $subject->id }}">{{ $subject->name }}</option>
+                @endforeach
+            </select>
+            <div class="text-danger small mt-1" id="error-subject_id"></div>
+        </div>
+        <div class="section">
+            <div id="slots"></div>
+            <div class="text-danger small mt-1" id="error-availability_id"></div>
+        </div>
+        <input type="hidden" name="availability_id" id="availability_id">
+        <button type="submit" class="stu_btn" id="bookBtn">Book Session</button>
+    </form>
+</div>
+@endsection
+@push('js')
+<script>
+$(document).ready(function () {
+
+    function formatTime(time) {
+        const [h, m] = time.split(':');
+        const hour = parseInt(h);
+        const ampm = hour >= 12 ? 'PM' : 'AM';
+        return `${hour % 12 || 12}:${m} ${ampm}`;
+    }
+
+    $('#booking_date, #subject').on('change', function () {
+
+        let bookingDate = $('#booking_date').val();
+        let subjectId   = $('#subject').val();
+
+        $('#slots').html('');
+
+        if (!bookingDate || !subjectId) {
+            return;
+        }
+
+        $('#slots').html('<p>Loading available sessions...</p>');
+
+        $.get("{{ route('student.available.slots') }}", {
+            booking_date: bookingDate,
+            subject_id: subjectId
+        }, function (response) {
+
+            if (!response.status) {
+                $('#slots').html(`
+                    <div class="alert alert-info">
+                        No available sessions for selected date.
+                    </div>
+                `);
+                return;
+            }
+
+            let html = `<h3>Choose Teacher & Time Slot</h3>`;
+
+            $.each(response.data, function (teacherId, slots) {
+
+                let teacherName = slots[0].teacher.first_name + ' ' + slots[0].teacher.last_name;
+
+                html += `<h4>${teacherName}</h4>`;
+
+                slots.forEach(slot => {
+                    html += `
+                        <label class="d-block">
+                            <input type="radio"
+                                   name="availability_id"
+                                   class="availability-radio"
+                                   value="${slot.id}">
+                            ${formatTime(slot.time_slot.start_time)} -
+                            ${formatTime(slot.time_slot.end_time)}
+                        </label>
+                    `;
+                });
+            });
+
+            $('#slots').html(html);
+        });
+    });
+
+    // Store selected availability
+    $(document).on('change', '.availability-radio', function () {
+        $('#availability_id').val($(this).val());
+    });
+
+});
+</script>
+@endpush
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<?php
+
+namespace App\Http\Controllers\Admin;
+
+use App\Http\Controllers\Controller;
+use App\Http\Requests\Admin\BookingRequest;
+use App\Models\Booking;
+use App\Models\Subject;
+use App\Models\TeacherSubject;
+use App\Models\TeacherWeeklyAvailability;
+use Carbon\Carbon;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\DB;
+use Stripe\Stripe;
+use Stripe\Checkout\Session;
+use Stripe\Checkout\Session as StripeSession;
+
+class StudentController extends Controller
+{
+    public function __construct()
+    {
+        $user = Auth::user();
+        if (!Auth::check() || Auth::user()->role !== 'Student') {
+            abort(403, 'Unauthorized Access');
+        }
+    }
+    public function student_home()
+    {
+        return view('admin.student.dashboard', ['title' => "Student - Dashboard"]);
+    }
+
+    public function student_book_session()
+    {
+        $subject = $subjects = Subject::whereHas('teachers')->get();
+        return view("admin.student.student_book_session", compact('subjects'));
+    }
+
+    public function getTeachersBySubject($subjectId)
+    {
+        $subject = Subject::with('teachers')->where('is_active', 1)->findOrFail($subjectId);
+        return response()->json($subject->teachers);
+    }
+
+    public function getTeacherAvailability(Request $request)
+    {
+        $request->validate([
+            'subject_id' => 'required|exists:subjects,id',
+            'teacher_id' => 'required|exists:users,id',
+        ]);
+        $valid = Subject::where('id', $request->subject_id)
+            ->whereHas('teachers', function ($q) use ($request) {
+                $q->where('users.id', $request->teacher_id);
+            })
+            ->exists();
+
+        if (!$valid) {
+            return response()->json([
+                'status' => false,
+                'message' => 'Invalid teacher for subject'
+            ], 403);
+        }
+        $teacherSubject = TeacherSubject::where('teacher_id', $request->teacher_id)
+            ->where('subject_id', $request->subject_id)
+            ->select('fee')
+            ->first();
+        $bookedAvailabilityIds = Booking::whereIn('status', ['paid', 'confirmed'])
+            ->pluck('teacher_weekly_availability_id')
+            ->toArray();
+
+        $availability = TeacherWeeklyAvailability::with('timeSlot')
+            ->where('teacher_id', $request->teacher_id)
+            ->where('subject_id', $request->subject_id)
+            ->orderBy('day_of_week')
+            ->orderBy('time_slot_id')
+            ->get()
+            ->groupBy('day_of_week');
+        return response()->json([
+            'status' => true,
+            'fee' => $teacherSubject?->fee,
+            'sessions' => $availability
+        ]);
+    }
+
+    // public function createCheckout(BookingRequest $request)
+    // {
+    //     $teacherSubject = TeacherSubject::where('teacher_id', $request->teacher_id)
+    //         ->where('subject_id', $request->subject_id)
+    //         ->firstOrFail();
+
+    //     $amount = (int) ($teacherSubject->fee * 100);
+
+    //     Stripe::setApiKey(config('services.stripe.secret'));
+
+    //     $session = Session::create([
+    //         'payment_method_types' => ['card'],
+    //         'mode' => 'payment',
+    //         'line_items' => [[
+    //             'price_data' => [
+    //                 'currency' => 'inr',
+    //                 'product_data' => [
+    //                     'name' => 'Session Booking',
+    //                 ],
+    //                 'unit_amount' => $amount,
+    //             ],
+    //             'quantity' => 1,
+    //         ]],
+    //         'success_url' => route('stripe.success') . '?session_id={CHECKOUT_SESSION_ID}',
+    //         'cancel_url' => route('stripe.cancel'),
+    //         'metadata' => [
+    //             'availability_id' => $request->availability_id,
+    //             'teacher_id' => $request->teacher_id,
+    //             'subject_id'      => $request->subject_id,
+    //             'student_id' => auth()->id(),
+    //         ]
+    //     ]);
+
+    //     return response()->json([
+    //         'status' => true,
+    //         'redirect_url' => $session->url,
+    //     ]);
+    // }
+
+    // public function success(Request $request)
+    // {
+    //     Stripe::setApiKey(config('services.stripe.secret'));
+
+    //     $session = StripeSession::retrieve($request->session_id);
+
+    //     if ($session->payment_status !== 'paid') {
+    //         abort(403, 'Payment not completed');
+    //     }
+
+    //     if (Booking::where('stripe_session_id', $session->id)->exists()) {
+    //         return view('admin.student.payment_success');
+    //     }
+
+    //     $availabilityId = (int) $session->metadata['availability_id'];
+    //     $teacherId      = (int) $session->metadata['teacher_id'];
+    //     $studentId      = (int) $session->metadata['student_id'];
+
+    //     $availability = TeacherWeeklyAvailability::with('timeSlot')
+    //         ->findOrFail($availabilityId);
+
+    //     $teacherSubject = TeacherSubject::where('teacher_id', $teacherId)
+    //         ->where('subject_id', $availability->subject_id)
+    //         ->firstOrFail();
+
+    //     $booking = new Booking();
+    //     $booking->student_id = $studentId;
+    //     $booking->teacher_id = $teacherId;
+    //     $booking->subject_id = $availability->subject_id;
+    //     $booking->teacher_weekly_availability_id = $availability->id;
+    //     $booking->time_slot_id = $availability->time_slot_id;
+    //     $booking->fee = $teacherSubject->fee;
+    //     $booking->status = 'confirmed';
+    //     $booking->stripe_session_id = $session->id;
+    //     $booking->stripe_payment_intent = $session->payment_intent;
+    //     $booking->save();
+
+    //     return view('admin.student.payment_success');
+    // }
+
+    public function bookingHistory()
+    {
+        $bookings = Booking::with([
+            'teacher',
+            'subject',
+            'availability',
+            'timeSlot'
+        ])
+            ->where('student_id', auth()->id())
+            ->latest()
+            ->get();
+        // dd($bookings);
+        return view('admin.student.booking_history', compact('bookings'));
+    }
+
+
+
+    public function getAvailableSlots(Request $request)
+{
+    $request->validate([
+        'booking_date' => 'required|date',
+        'subject_id'   => 'required|exists:subjects,id',
+    ]);
+
+    // Convert date → day_of_week (1–7)
+    $dayOfWeek = Carbon::parse($request->booking_date)->dayOfWeekIso;
+
+    // Teachers on leave for selected date
+    $absentTeacherIds = DB::table('teacher_absences')
+        ->whereDate('from_date', '<=', $request->booking_date)
+        ->whereDate('to_date', '>=', $request->booking_date)
+        ->pluck('teacher_id');
+
+    // Already booked slots for selected date
+    $bookedAvailabilityIds = Booking::where('booking_date', $request->booking_date)
+        ->whereIn('status', ['paid', 'confirmed'])
+        ->pluck('teacher_weekly_availability_id');
+
+    // Get availability
+    $availability = TeacherWeeklyAvailability::with([
+            'timeSlot',
+            'teacher:id,first_name,last_name'
+        ])
+        ->where('subject_id', $request->subject_id)
+        ->where('day_of_week', $dayOfWeek)
+        ->whereNotIn('teacher_id', $absentTeacherIds)
+        ->whereNotIn('id', $bookedAvailabilityIds)
+        ->orderBy('teacher_id')
+        ->orderBy('time_slot_id')
+        ->get()
+        ->groupBy('teacher_id');
+
+    if ($availability->isEmpty()) {
+        return response()->json([
+            'status' => false,
+            'message' => 'No available slots'
+        ]);
+    }
+
+    return response()->json([
+        'status' => true,
+        'data'   => $availability
+    ]);
+}
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    Route::get('/student/available-slots', [StudentController::class, 'getAvailableSlots'])
+    ->name('student.available.slots');
+
+
+
+        Schema::create('bookings', function (Blueprint $table) {
+            $table->id();
+            $table->foreignId('student_id')->constrained('users')->onDelete('cascade');
+            $table->date('booking_date');
+            $table->foreignId('teacher_id')->constrained('users')->onDelete('cascade');
+            $table->foreignId('subject_id')->constrained('subjects')->onDelete('cascade');
+            $table->foreignId('teacher_weekly_availability_id')->constrained('teacher_weekly_availability')->cascadeOnDelete();
+            $table->foreignId('time_slot_id')->constrained('time_slots')->cascadeOnDelete();
+            $table->decimal('fee', 8, 2);
+            $table->enum('status', ['pending', 'paid', 'confirmed', 'cancelled'])->default('pending');
+            $table->string('stripe_session_id')->nullable();
+            $table->string('stripe_payment_intent')->nullable();
+            $table->timestamps();
+            $table->unique(
+                ['student_id', 'teacher_id', 'subject_id', 'teacher_weekly_availability_id'],
+                'unique_student_teacher_subject_slot'
+            );
+        });
